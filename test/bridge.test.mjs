@@ -31,6 +31,14 @@ function helperCallCount(fixture) {
   return fs.readFileSync(fixture.marker, "utf8").split("\n").filter(Boolean).length;
 }
 
+async function waitFor(predicate, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("condition timed out");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 function listen(server) {
   return new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -175,7 +183,7 @@ test("configuration keeps the bridge and upstream pinned to IPv4 loopback Codex 
   assert.equal(loadConfig(configPath).listenHost, "127.0.0.1");
 });
 
-test("arbitrary Codex HTTP routes, methods, body types and end-to-end headers pass transparently", async (t) => {
+test("unknown Codex routes, methods, body types and application headers pass transparently", async (t) => {
   const fixture = makeFixture(t);
   const received = [];
   const upstream = http.createServer((incoming, response) => {
@@ -219,6 +227,13 @@ test("arbitrary Codex HTTP routes, methods, body types and end-to-end headers pa
       "x-oai-attestation": "attestation-123",
       "x-future-codex-header": "future-request",
       "x-openai-actor-authorization": "must-be-overwritten",
+      forwarded: "for=198.51.100.10;proto=https",
+      "x-forwarded-for": "198.51.100.10",
+      "x-forwarded-proto": "https",
+      "x-forwarded-future": "transport-owned",
+      "x-real-ip": "198.51.100.10",
+      "true-client-ip": "198.51.100.10",
+      "cf-connecting-ip": "198.51.100.10",
       connection: "close, x-client-hop",
       "x-client-hop": "must-not-cross-hop",
     }),
@@ -226,6 +241,7 @@ test("arbitrary Codex HTTP routes, methods, body types and end-to-end headers pa
 
   assert.equal(result.status, 201);
   assert.equal(result.body, "opaque-response");
+  // Location on a non-redirect response is application data and must remain untouched.
   assert.equal(result.headers.location, "/backend-api/codex/realtime/calls/call-123");
   assert.deepEqual(result.headers["set-cookie"], ["one=1; Path=/", "two=2; Path=/"]);
   assert.equal(result.headers["x-codex-imagegen-request-id"], "image-request-123");
@@ -238,19 +254,34 @@ test("arbitrary Codex HTTP routes, methods, body types and end-to-end headers pa
   assert.deepEqual(received[0].body, body);
   assert.equal(received[0].headers.authorization, `Bearer ${PROVIDER_TOKEN}`);
   assert.equal(received[0].headers["x-openai-actor-authorization"], "codex-lb");
-  assert.equal(received[0].headers.cookie, "native-client-cookie=1");
-  assert.equal(received[0].headers["x-api-key"], "native-client-header");
-  assert.equal(received[0].headers["x-codex-image-turn-id"], "turn-123");
-  assert.equal(received[0].headers["x-openai-memgen-request"], "memory-123");
-  assert.equal(received[0].headers["x-oai-attestation"], "attestation-123");
-  assert.equal(received[0].headers["x-future-codex-header"], "future-request");
-  assert.equal(received[0].headers["x-client-hop"], undefined);
+  for (const [name, value] of Object.entries({
+    cookie: "native-client-cookie=1",
+    "x-api-key": "native-client-header",
+    "x-codex-image-turn-id": "turn-123",
+    "x-openai-memgen-request": "memory-123",
+    "x-oai-attestation": "attestation-123",
+    "x-future-codex-header": "future-request",
+  })) {
+    assert.equal(received[0].headers[name], value);
+  }
+  for (const name of [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-future",
+    "x-real-ip",
+    "true-client-ip",
+    "cf-connecting-ip",
+    "x-client-hop",
+  ]) {
+    assert.equal(received[0].headers[name], undefined, name);
+  }
   assert.notEqual(received[0].headers.host, `127.0.0.1:${address.port}`);
   assert.doesNotMatch(JSON.stringify(received), new RegExp(CHATGPT_TOKEN, "u"));
   assert.doesNotMatch(JSON.stringify(logs), /chatgpt-test-token|synthetic-provider/u);
   assert.deepEqual(logs.at(-1), {
     event: "request_complete",
-    route: "PATCH /future/new-feature",
+    route: "PATCH /<redacted>",
     status: 201,
   });
 });
@@ -280,6 +311,11 @@ test("known Codex endpoints remain ordinary routes rather than special cases", a
     ["POST", "/images/edits", "{}"],
     ["POST", "/memories/trace_summarize", "{}"],
     ["POST", "/realtime/calls", "{}"],
+    ["POST", "/thread/goal/get", "{}"],
+    ["POST", "/analytics-events/events", "{}"],
+    ["POST", "/safety/arc", "{}"],
+    ["GET", "/agent-identities/jwks", ""],
+    ["GET", "/opportunistic/admission", ""],
     ["GET", "", ""],
   ];
   for (const [method, suffix, body] of cases) {
@@ -321,6 +357,22 @@ test("outside-namespace and wrong-auth requests fail before provider lookup", as
   assert.equal(wrong.status, 401);
   assert.equal(helperCallCount(fixture), 0);
   assert.equal(upstreamCalls, 0);
+});
+
+test("an unreadable auth snapshot returns 503 instead of a false credential mismatch", async (t) => {
+  const fixture = makeFixture(t);
+  const upstream = http.createServer((_request, response) => response.end("unexpected"));
+  const upstreamAddress = await listen(upstream);
+  t.after(() => close(upstream));
+  const { address } = await startBridge(t, configFor(fixture, upstreamAddress.port));
+  fs.writeFileSync(fixture.authFile, "{", { mode: 0o600 });
+
+  const result = await request(
+    `http://127.0.0.1:${address.port}${PUBLIC_BASE}/models`,
+    { headers: authHeaders() },
+  );
+  assert.equal(result.status, 503);
+  assert.equal(helperCallCount(fixture), 0);
 });
 
 test("routing hints and future metadata are forwarded opaquely", async (t) => {
@@ -384,7 +436,37 @@ test("ChatGPT and provider credential rotations are observed on the next request
   ]);
 });
 
-test("declared and streamed request limits remain enforced", async (t) => {
+test("disconnect during provider lookup cancels the helper and promptly frees capacity", async (t) => {
+  const fixture = makeFixture(t);
+  writeProviderHelper(fixture, { delayMs: 10_000 });
+  const upstream = http.createServer((_incoming, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end('{"data":[]}');
+  });
+  const upstreamAddress = await listen(upstream);
+  t.after(() => close(upstream));
+  const { address } = await startBridge(t, configFor(fixture, upstreamAddress.port, {
+    maxConnections: 1,
+    tokenTimeoutMs: 5_000,
+  }));
+  const url = `http://127.0.0.1:${address.port}${PUBLIC_BASE}/models`;
+
+  const abandoned = http.request(url, { headers: authHeaders() });
+  abandoned.once("error", () => {});
+  abandoned.end();
+  await waitFor(() => helperCallCount(fixture) === 1);
+  abandoned.destroy();
+  writeProviderHelper(fixture);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const started = Date.now();
+  const next = await request(url, { headers: authHeaders() });
+  assert.equal(next.status, 200);
+  assert.ok(Date.now() - started < 1_000);
+  assert.equal(helperCallCount(fixture), 2);
+});
+
+test("declared and streamed request limits remain enforced without leaking capacity", async (t) => {
   const fixture = makeFixture(t);
   let calls = 0;
   const upstream = http.createServer((incoming, response) => {
@@ -395,6 +477,7 @@ test("declared and streamed request limits remain enforced", async (t) => {
   const upstreamAddress = await listen(upstream);
   t.after(() => close(upstream));
   const { address } = await startBridge(t, configFor(fixture, upstreamAddress.port, {
+    maxConnections: 1,
     maxRequestBytes: 16,
   }));
   const url = `http://127.0.0.1:${address.port}${PUBLIC_BASE}/future/upload`;
@@ -419,7 +502,7 @@ test("declared and streamed request limits remain enforced", async (t) => {
   assert.equal(next.status, 200);
 });
 
-test("SSE remains incremental and response size limits still terminate oversized streams", async (t) => {
+test("SSE remains incremental and oversized responses terminate without leaking capacity", async (t) => {
   const fixture = makeFixture(t);
   let mode = "sse";
   const upstream = http.createServer((_incoming, response) => {
@@ -429,12 +512,17 @@ test("SSE remains incremental and response size limits still terminate oversized
       setTimeout(() => response.end("data: second\n\n"), 120);
       return;
     }
-    response.writeHead(200, { "content-type": "application/octet-stream" });
-    response.end("x".repeat(64));
+    if (mode === "oversized") {
+      response.writeHead(200, { "content-type": "application/octet-stream" });
+      response.end("x".repeat(64));
+      return;
+    }
+    response.end("ok");
   });
   const upstreamAddress = await listen(upstream);
   t.after(() => close(upstream));
   const { address } = await startBridge(t, configFor(fixture, upstreamAddress.port, {
+    maxConnections: 1,
     maxResponseBytes: 32,
   }));
   const url = `http://127.0.0.1:${address.port}${PUBLIC_BASE}/responses`;
@@ -450,16 +538,60 @@ test("SSE remains incremental and response size limits still terminate oversized
   assert.equal(oversized.status, 200);
   assert.equal(oversized.completed, false);
   assert.ok(oversized.body.length <= 32);
+
+  mode = "ok";
+  const next = await request(url, { method: "POST", headers: authHeaders() });
+  assert.equal(next.status, 200);
+  assert.equal(next.body, "ok");
 });
 
-test("redirects pass through but upstream auth failures remain bridge-local 502 errors", async (t) => {
+test("cancelling an SSE consumer closes upstream and frees capacity", async (t) => {
   const fixture = makeFixture(t);
-  let status = 302;
+  let calls = 0;
+  let firstClosed = false;
   const upstream = http.createServer((_incoming, response) => {
-    response.writeHead(status, {
-      location: "/backend-api/codex/future-location",
-      "www-authenticate": "Bearer provider-realm",
+    calls += 1;
+    if (calls === 1) {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write("data: first\n\n");
+      response.once("close", () => { firstClosed = true; });
+      return;
+    }
+    response.end("ok");
+  });
+  const upstreamAddress = await listen(upstream);
+  t.after(() => close(upstream));
+  const { address } = await startBridge(t, configFor(fixture, upstreamAddress.port, {
+    maxConnections: 1,
+  }));
+  const url = `http://127.0.0.1:${address.port}${PUBLIC_BASE}/responses`;
+
+  await new Promise((resolve, reject) => {
+    const call = http.request(url, { method: "POST", headers: authHeaders() }, (response) => {
+      response.once("data", () => response.destroy());
+      response.once("close", resolve);
     });
+    call.once("error", reject);
+    call.end();
+  });
+  await waitFor(() => firstClosed);
+  const next = await request(url, { method: "POST", headers: authHeaders() });
+  assert.equal(next.status, 200);
+});
+
+test("redirects inside the Codex namespace are rewritten through the secret prefix", async (t) => {
+  const fixture = makeFixture(t);
+  let mode = "relative";
+  const upstream = http.createServer((_incoming, response) => {
+    if (mode === "relative") {
+      response.writeHead(302, { location: "/backend-api/codex/future-location" });
+    } else if (mode === "absolute") {
+      response.writeHead(307, {
+        location: `http://127.0.0.1:${upstream.address().port}/backend-api/codex/next?x=1#fragment`,
+      });
+    } else if (mode === "external") {
+      response.writeHead(302, { location: "https://example.com/elsewhere" });
+    }
     response.end();
   });
   const upstreamAddress = await listen(upstream);
@@ -467,17 +599,48 @@ test("redirects pass through but upstream auth failures remain bridge-local 502 
   const { address } = await startBridge(t, configFor(fixture, upstreamAddress.port));
   const url = `http://127.0.0.1:${address.port}${PUBLIC_BASE}/future/redirect`;
 
-  const redirect = await request(url, { headers: authHeaders() });
-  assert.equal(redirect.status, 302);
-  assert.equal(redirect.headers.location, "/backend-api/codex/future-location");
+  const relative = await request(url, { headers: authHeaders() });
+  assert.equal(relative.status, 302);
+  assert.equal(relative.headers.location, `${PUBLIC_BASE}/future-location`);
 
-  status = 401;
+  mode = "absolute";
+  const absolute = await request(url, { headers: authHeaders() });
+  assert.equal(absolute.status, 307);
+  assert.equal(absolute.headers.location, `${PUBLIC_BASE}/next?x=1#fragment`);
+
+  mode = "external";
+  const external = await request(url, { headers: authHeaders() });
+  assert.equal(external.status, 302);
+  assert.equal(external.headers.location, "https://example.com/elsewhere");
+});
+
+test("only provider 401 is masked; application 403 remains transparent", async (t) => {
+  const fixture = makeFixture(t);
+  let status = 401;
+  const upstream = http.createServer((_incoming, response) => {
+    response.writeHead(status, {
+      "content-type": "application/json",
+      "www-authenticate": "Bearer provider-realm",
+      "x-policy-detail": "preserve-on-403",
+    });
+    response.end('{"error":{"code":"policy_denied"}}');
+  });
+  const upstreamAddress = await listen(upstream);
+  t.after(() => close(upstream));
+  const { address } = await startBridge(t, configFor(fixture, upstreamAddress.port));
+  const url = `http://127.0.0.1:${address.port}${PUBLIC_BASE}/future/status`;
+
   const unauthorized = await request(url, { headers: authHeaders() });
   assert.equal(unauthorized.status, 502);
   assert.equal(unauthorized.headers["www-authenticate"], undefined);
+  assert.doesNotMatch(unauthorized.body, /policy_denied/u);
 
   status = 403;
-  assert.equal((await request(url, { headers: authHeaders() })).status, 502);
+  const forbidden = await request(url, { headers: authHeaders() });
+  assert.equal(forbidden.status, 403);
+  assert.equal(forbidden.headers["x-policy-detail"], "preserve-on-403");
+  assert.equal(forbidden.headers["www-authenticate"], "Bearer provider-realm");
+  assert.equal(forbidden.body, '{"error":{"code":"policy_denied"}}');
 });
 
 function websocketHandshake(port, requestPath, authorization, options = {}) {
@@ -506,6 +669,12 @@ function websocketHandshake(port, requestPath, authorization, options = {}) {
         "X-Api-Key: native-ws-header",
         "X-Future-Codex-WS: future-ws-request",
         "X-OpenAI-Actor-Authorization: must-be-overwritten",
+        "Forwarded: for=198.51.100.10;proto=https",
+        "X-Forwarded-For: 198.51.100.10",
+        "X-Forwarded-Future: transport-owned",
+        "X-Real-IP: 198.51.100.10",
+        "True-Client-IP: 198.51.100.10",
+        "CF-Connecting-IP: 198.51.100.10",
         "",
         "",
       ];
@@ -529,15 +698,15 @@ function websocketHandshake(port, requestPath, authorization, options = {}) {
   });
 }
 
-test("WebSocket upgrades are transparent for any Codex namespace path", async (t) => {
+test("WebSocket upgrades remain transparent while proxy identity and dynamic log paths are controlled", async (t) => {
   const fixture = makeFixture(t);
   const observed = {};
   const upstream = http.createServer();
-  upstream.on("upgrade", (request, socket) => {
-    observed.url = request.url;
-    observed.headers = request.headers;
+  upstream.on("upgrade", (incoming, socket) => {
+    observed.url = incoming.url;
+    observed.headers = incoming.headers;
     const accept = crypto.createHash("sha1")
-      .update(request.headers["sec-websocket-key"] + WS_GUID)
+      .update(incoming.headers["sec-websocket-key"] + WS_GUID)
       .digest("base64");
     socket.write([
       "HTTP/1.1 101 Switching Protocols",
@@ -561,10 +730,11 @@ test("WebSocket upgrades are transparent for any Codex namespace path", async (t
   t.after(() => close(upstream));
   const logs = [];
   const { address } = await startBridge(t, configFor(fixture, upstreamAddress.port), logs);
+  const sensitiveCallId = "call-sensitive-id-123";
 
   const connection = await websocketHandshake(
     address.port,
-    `${PUBLIC_BASE}/realtime/sideband/call-123?mode=future`,
+    `${PUBLIC_BASE}/${sensitiveCallId}?mode=future`,
     `Bearer ${CHATGPT_TOKEN}`,
   );
   assert.match(connection.headers, /^HTTP\/1\.1 101 /u);
@@ -586,18 +756,28 @@ test("WebSocket upgrades are transparent for any Codex namespace path", async (t
   connection.socket.write(clientFrame);
   await new Promise((resolve) => connection.socket.once("close", resolve));
 
-  assert.equal(observed.url, "/backend-api/codex/realtime/sideband/call-123?mode=future");
+  assert.equal(observed.url, `/backend-api/codex/${sensitiveCallId}?mode=future`);
   assert.equal(observed.headers.authorization, `Bearer ${PROVIDER_TOKEN}`);
   assert.equal(observed.headers["x-openai-actor-authorization"], "codex-lb");
   assert.equal(observed.headers.cookie, "native-ws-cookie=1");
   assert.equal(observed.headers["x-api-key"], "native-ws-header");
   assert.equal(observed.headers["x-future-codex-ws"], "future-ws-request");
-  assert.equal(observed.headers["x-client-hop"], undefined);
+  for (const name of [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-future",
+    "x-real-ip",
+    "true-client-ip",
+    "cf-connecting-ip",
+    "x-client-hop",
+  ]) {
+    assert.equal(observed.headers[name], undefined, name);
+  }
   assert.deepEqual(observed.clientFrame, clientFrame);
   assert.ok(logs.some((entry) => (
-    entry.event === "websocket_connected"
-      && entry.route === "GET /realtime/sideband/call-123"
+    entry.event === "websocket_connected" && entry.route === "GET /<redacted>"
   )));
+  assert.doesNotMatch(JSON.stringify(logs), /call-sensitive-id-123/u);
   assert.doesNotMatch(JSON.stringify(logs), /chatgpt-test-token|synthetic-provider/u);
 });
 
@@ -636,4 +816,42 @@ test("WebSocket still validates the transport handshake and local ChatGPT auth",
   assert.match(outside.headers, /^HTTP\/1\.1 404 /u);
   outside.socket.destroy();
   assert.equal(helperCallCount(fixture), 0);
+});
+
+test("WebSocket handshake timeout closes a silent upstream and frees capacity", async (t) => {
+  const fixture = makeFixture(t);
+  const upgradedSockets = new Set();
+  const upstream = http.createServer((_incoming, response) => response.end("ok"));
+  upstream.on("upgrade", (_incoming, socket) => {
+    upgradedSockets.add(socket);
+    socket.once("close", () => upgradedSockets.delete(socket));
+    socket.once("error", () => {});
+    socket.resume();
+  });
+  const upstreamAddress = await listen(upstream);
+  t.after(async () => {
+    for (const socket of upgradedSockets) socket.destroy();
+    await close(upstream);
+  });
+  const { address } = await startBridge(t, configFor(fixture, upstreamAddress.port, {
+    connectTimeoutMs: 100,
+    idleTimeoutMs: 5_000,
+    maxConnections: 1,
+  }));
+
+  const connection = await websocketHandshake(
+    address.port,
+    `${PUBLIC_BASE}/responses`,
+    `Bearer ${CHATGPT_TOKEN}`,
+    { timeoutMs: 1_500 },
+  );
+  assert.match(connection.headers, /^HTTP\/1\.1 502 /u);
+  assert.ok(connection.totalMs < 1_000, JSON.stringify({ totalMs: connection.totalMs }));
+  connection.socket.destroy();
+
+  const next = await request(
+    `http://127.0.0.1:${address.port}${PUBLIC_BASE}/models`,
+    { headers: authHeaders() },
+  );
+  assert.equal(next.status, 200);
 });
