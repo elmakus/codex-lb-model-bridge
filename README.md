@@ -50,19 +50,41 @@ The security boundary remains narrow:
   `/backend-api/codex` namespace, so the bridge is not an open proxy;
 - HTTP hop-by-hop headers, plus headers named by `Connection`, are stripped and
   rebuilt as required by the next hop;
+- proxy-identity metadata supplied by the desktop client (`Forwarded`,
+  `X-Forwarded-*`, `X-Real-IP`, `True-Client-IP`, and `CF-Connecting-IP`) is
+  stripped instead of being trusted by the loopback Codex-LB hop;
 - request/response sizes, connection counts, helper runtime, connect time and
   idle time remain bounded;
-- provider-side `401`/`403` responses become a generic local `502`, so a
-  provider credential failure does not invalidate the desktop client's own
-  ChatGPT login;
+- provider-side `401` responses become a generic local `502`, so a provider
+  credential failure does not invalidate the desktop client's own ChatGPT
+  login; application statuses such as `403` remain transparent;
 - WebSocket frames and streamed response bodies remain opaque and are not
-  logged.
+  logged;
+- request logs redact arbitrary/dynamic path identifiers instead of recording
+  them verbatim.
 
 All other end-to-end request and response headers are preserved, including
-future `x-codex-*` / `x-openai-*` metadata, cookies, `Location`, `Set-Cookie`,
-and headers that the current bridge version does not know by name. Request
-bodies are also treated opaquely; the bridge does not require JSON or a fixed
-content encoding.
+future `x-codex-*` / `x-openai-*` metadata, cookies, `Set-Cookie`, and headers
+that the current bridge version does not know by name. Request bodies are also
+treated opaquely; the bridge does not require JSON or a fixed content encoding.
+
+`Location` is normally preserved as application data. For an actual HTTP 3xx
+redirect that points back into the same configured Codex upstream namespace,
+the bridge rewrites only the local path prefix so a redirect-following client
+returns through the generated bridge path instead of bypassing it. A non-3xx
+`Location` value, including the value used to carry realtime call identity,
+is not rewritten.
+
+## Realtime note
+
+Namespace transparency does not by itself guarantee every realtime transport
+uses the bridge. Current Codex WebRTC sideband code can construct a direct
+`api.openai.com` WebSocket URL independently of the configured provider base
+URL. In a multi-account Codex-LB deployment, that creates an account-affinity
+constraint that cannot be solved merely by accepting more bridge paths. The
+bridge therefore remains transparent for any realtime HTTP/WebSocket traffic
+that reaches it, but does not claim that provider-base rewriting alone routes
+every WebRTC sideband through Codex-LB.
 
 ## Install
 
@@ -115,9 +137,12 @@ npm test
 
 The tests use synthetic credentials, hosts, and upstreams only. Bridge tests
 cover transparent forwarding of unknown/future HTTP routes, methods, body
-types and headers; current Codex routes; credential replacement; namespace
-isolation; stream limits; SSE; redirects; provider-auth failures; and generic
-WebSocket paths. Installer and rollback tests cover deployment and recovery.
+types and application headers; proxy-identity stripping; current Codex routes;
+credential replacement and rotation; namespace isolation; helper cancellation;
+request/response limits and capacity release; SSE cancellation; redirect
+rewriting; provider `401` masking versus `403` passthrough; dynamic-path log
+redaction; and generic WebSocket paths and timeout cleanup. Installer and
+rollback tests cover deployment and recovery.
 
 ## License
 
