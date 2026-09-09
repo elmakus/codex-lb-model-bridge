@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "listenHost": "127.0.0.1",
+  "listenPort": 12455,
+  "publicBasePath": "/REPLACE_WITH_64_HEX_CHARACTERS/backend-api/codex",
+  "upstreamBaseUrl": "http://127.0.0.1:12456/backend-api/codex",
+  "authFile": "/path/to/codex/auth.json",
+  "providerTokenHelper": "/path/to/provider-token-helper",
+  "providerTokenPrefix": "sk-clb-",
+  "actorAuthorization": "codex-lb",
+  "tokenTimeoutMs": 5000,
+  "connectTimeoutMs": 10000,
+  "idleTimeoutMs": 3600000,
+  "maxConnections": 32,
+  "maxRequestBytes": 268435456,
+  "maxResponseBytes": 268435456
+}

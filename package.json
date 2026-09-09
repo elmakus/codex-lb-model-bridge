@@ -1,0 +1,9 @@
+{
+  "name": "codex-lb-model-bridge",
+  "version": "0.1.0",
+  "description": "Authenticated local bridge for routing Codex model traffic through a user-managed upstream",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}

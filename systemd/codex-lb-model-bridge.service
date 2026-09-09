@@ -1,0 +1,45 @@
+[Unit]
+Description=Authenticated Codex model bridge for ChatGPT Remote Control
+After=codex-lb-ssh-tunnel.service gnome-keyring-daemon.service
+Wants=codex-lb-ssh-tunnel.service gnome-keyring-daemon.service
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node %h/.local/libexec/codex-lb-model-bridge/bridge.mjs %E/codex-lb-model-bridge/config.json
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=7
+KillMode=mixed
+Environment=HOME=%h
+Environment=XDG_CONFIG_HOME=%E
+Environment=XDG_RUNTIME_DIR=%t
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+LimitCORE=0
+LimitNOFILE=1024
+TasksMax=64
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=read-only
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+UMask=0077
+InaccessiblePaths=-%h/.ssh
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=graphical-session.target
