@@ -15,98 +15,37 @@ const MAX_CONFIG_BYTES = 128 * 1024;
 const MAX_AUTH_BYTES = 128 * 1024;
 const MAX_HELPER_OUTPUT_BYTES = 16 * 1024;
 const MAX_UPSTREAM_HEADERS_BYTES = 64 * 1024;
-const MAX_ROUTING_HINT_BYTES = 512;
 const MAX_STREAM_BYTES = 512 * 1024 * 1024;
 const MAX_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const SAFE_TOKEN = /^[^\u0000-\u0020\u007f]+$/u;
 const SAFE_ACTOR = /^[A-Za-z0-9._~-]{1,128}$/u;
 const SAFE_HEADER_VALUE = /^[\t\x20-\x7e\x80-\xff]*$/u;
-const CODEX_ROUTING_HINT = /^model=[^;\s]+(?:;tier=[^;\s]+)?$/u;
+const SAFE_HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u;
 const PUBLIC_BASE_PATH = /^\/[a-f0-9]{64}\/backend-api\/codex$/u;
 
-const HTTP_ROUTES = new Map([
-  ["GET /models", "models"],
-  ["POST /responses", "responses"],
-  ["POST /responses/compact", "responses_compact"],
-  // Codex 0.153.4 uses this single JSON RPC for all web.run commands.
-  ["POST /alpha/search", "web_search"],
+// Headers that are scoped to one transport hop and must be rebuilt by the
+// bridge rather than copied end-to-end. Header names nominated by Connection
+// are stripped dynamically as well.
+const HOP_BY_HOP_HEADERS = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
 ]);
 
-const REQUEST_HEADER_ALLOWLIST = new Set([
-  "accept",
-  "accept-encoding",
-  "content-encoding",
-  "content-type",
-  "openai-beta",
-  "originator",
-  "session-id",
-  "thread-id",
-  "user-agent",
-  "version",
-  "x-client-request-id",
-  "x-codex-beta-features",
-  "x-codex-inference-call-id",
-  "x-codex-installation-id",
-  "x-codex-parent-thread-id",
-  "x-codex-routing-hint",
-  "x-codex-turn-metadata",
-  "x-codex-turn-state",
-  "x-codex-window-id",
-  "x-openai-internal-codex-responses-lite",
-  "x-openai-subagent",
-  "x-responsesapi-include-timing-metrics",
+// These are the only application headers owned by the bridge. The incoming
+// ChatGPT bearer authenticates the local client but must never become the
+// upstream bearer. Actor authorization is likewise set from bridge config.
+const BRIDGE_REQUEST_HEADERS = new Set([
+  "authorization",
+  "host",
+  "x-openai-actor-authorization",
 ]);
-
-const WEBSOCKET_HEADER_ALLOWLIST = new Set([
-  ...REQUEST_HEADER_ALLOWLIST,
-  "sec-websocket-extensions",
-  "sec-websocket-key",
-  "sec-websocket-protocol",
-  "sec-websocket-version",
-]);
-
-const RESPONSE_HEADER_ALLOWLIST = new Set([
-  "cache-control",
-  "cf-ray",
-  "content-encoding",
-  "content-type",
-  "etag",
-  "openai-model",
-  "openai-processing-ms",
-  "openai-version",
-  "retry-after",
-  "x-codex-active-limit",
-  "x-codex-credits-balance",
-  "x-codex-credits-has-credits",
-  "x-codex-credits-unlimited",
-  "x-codex-promo-message",
-  "x-codex-rate-limit-reached-type",
-  "x-codex-safety-buffering-enabled",
-  "x-codex-safety-buffering-faster-model",
-  "x-codex-turn-state",
-  "x-models-etag",
-  "x-oai-request-id",
-  "x-openai-model",
-  "x-reasoning-included",
-  "x-request-id",
-  "x-ratelimit-limit-requests",
-  "x-ratelimit-limit-tokens",
-  "x-ratelimit-remaining-requests",
-  "x-ratelimit-remaining-tokens",
-  "x-ratelimit-reset-requests",
-  "x-ratelimit-reset-tokens",
-]);
-
-const RESPONSE_RATE_LIMIT_HEADER = /^x-[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?-(?:(?:primary|secondary)-(?:used-percent|window-minutes|reset-at)|limit-name)$/u;
-
-const WEBSOCKET_RESPONSE_HEADER_ALLOWLIST = new Set([
-  "openai-model",
-  "x-codex-turn-state",
-  "x-reasoning-included",
-]);
-
-const BROWSER_HEADER = /^(?:(?:origin|referer)$|sec-fetch-|sec-ch-ua)/u;
 
 class BridgeError extends Error {
   constructor(code, status = 502) {
@@ -199,6 +138,7 @@ export function normalizeConfig(value) {
   if (typeof value.actorAuthorization !== "string" || !SAFE_ACTOR.test(value.actorAuthorization)) {
     fail("invalid_actor_authorization");
   }
+
   const numberDefaults = {
     connectTimeoutMs: 10_000,
     idleTimeoutMs: 60 * 60 * 1000,
@@ -308,61 +248,49 @@ async function authorizeClient(config, request) {
   return false;
 }
 
-function hasBrowserHeaders(request) {
-  for (let index = 0; index < request.rawHeaders.length; index += 2) {
-    if (BROWSER_HEADER.test(request.rawHeaders[index].toLowerCase())) return true;
-  }
-  return false;
+function connectionTokens(values) {
+  return values
+    .flatMap((value) => String(value || "").split(","))
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
 }
 
-function collectForwardHeaders(request, allowlist) {
-  const collected = new Map();
+function appendHeader(result, name, value) {
+  if (result[name] == null) {
+    result[name] = value;
+    return;
+  }
+  if (Array.isArray(result[name])) result[name].push(value);
+  else result[name] = [result[name], value];
+}
+
+function connectionScopedRequestHeaders(request) {
+  const result = new Set(HOP_BY_HOP_HEADERS);
+  for (const token of connectionTokens(rawHeaderValues(request, "connection"))) result.add(token);
+  return result;
+}
+
+function collectForwardHeaders(request) {
+  const blocked = connectionScopedRequestHeaders(request);
+  const collected = {};
   for (let index = 0; index < request.rawHeaders.length; index += 2) {
     const name = request.rawHeaders[index].toLowerCase();
-    if (!allowlist.has(name)) continue;
-    if (collected.has(name)) fail("duplicate_forward_header", 400);
-    collected.set(name, request.rawHeaders[index + 1]);
+    const value = request.rawHeaders[index + 1];
+    if (blocked.has(name) || BRIDGE_REQUEST_HEADERS.has(name)) continue;
+    appendHeader(collected, name, value);
   }
-  return Object.fromEntries(collected);
+  return collected;
 }
 
-function validateRoutingHint(request) {
-  const values = rawHeaderValues(request, "x-codex-routing-hint");
-  if (values.length > 1) fail("duplicate_forward_header", 400);
-  if (values.length === 0) return;
-  if (
-    Buffer.byteLength(values[0], "utf8") > MAX_ROUTING_HINT_BYTES
-    || !CODEX_ROUTING_HINT.test(values[0])
-  ) {
-    fail("invalid_codex_routing_hint", 400);
-  }
-}
-
-function validateIncomingRequest(config, request, routeName) {
+function validateIncomingRequest(config, request) {
   if (request.rawHeaders.length / 2 > 64) fail("too_many_headers", 431);
   if (Buffer.byteLength(request.url || "") > 4096) fail("request_target_too_large", 414);
-  validateRoutingHint(request);
   const contentLengthValues = rawHeaderValues(request, "content-length");
   if (contentLengthValues.length > 1) fail("duplicate_content_length", 400);
   const contentLength = contentLengthValues[0];
   if (contentLength != null) {
     if (!/^(?:0|[1-9][0-9]*)$/u.test(contentLength)) fail("invalid_content_length", 400);
     if (Number(contentLength) > config.maxRequestBytes) fail("request_too_large", 413);
-  }
-  if (routeName === "models") {
-    if ((contentLength != null && contentLength !== "0") || request.headers["transfer-encoding"] != null) {
-      fail("get_body_rejected", 400);
-    }
-    return;
-  }
-  const contentType = rawHeaderValues(request, "content-type");
-  if (contentType.length !== 1 || !/^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(contentType[0])) {
-    fail("unsupported_content_type", 415);
-  }
-  const contentEncoding = rawHeaderValues(request, "content-encoding");
-  if (contentEncoding.length > 1) fail("duplicate_content_encoding", 400);
-  if (contentEncoding.length === 1 && !/^(?:identity|zstd)$/iu.test(contentEncoding[0])) {
-    fail("unsupported_content_encoding", 415);
   }
 }
 
@@ -407,10 +335,6 @@ function loadProviderToken(config, { signal } = {}) {
     let output = Buffer.alloc(0);
     let settled = false;
     let timer;
-    const onAbort = () => {
-      child.kill("SIGKILL");
-      finish(new BridgeError("provider_helper_cancelled", 499));
-    };
     const finish = (error, token) => {
       if (settled) return;
       settled = true;
@@ -419,6 +343,10 @@ function loadProviderToken(config, { signal } = {}) {
       output.fill(0);
       if (error) reject(error);
       else resolve(token);
+    };
+    const onAbort = () => {
+      child.kill("SIGKILL");
+      finish(new BridgeError("provider_helper_cancelled", 499));
     };
     timer = setTimeout(() => {
       child.kill("SIGKILL");
@@ -463,25 +391,33 @@ function loadProviderToken(config, { signal } = {}) {
 
 function resolveRoute(config, requestUrl) {
   const parsed = new URL(requestUrl || "/", "http://loopback.invalid");
+  if (parsed.pathname === config.publicBasePath) return { parsed, suffix: "" };
   if (!parsed.pathname.startsWith(`${config.publicBasePath}/`)) fail("route_not_found", 404);
-  const suffix = parsed.pathname.slice(config.publicBasePath.length);
-  return { parsed, suffix };
+  return { parsed, suffix: parsed.pathname.slice(config.publicBasePath.length) };
 }
 
 function destinationFor(config, suffix, search) {
   return new URL(`${config.upstream.pathname}${suffix}${search}`, config.upstream.origin);
 }
 
-function filteredResponseHeaders(headers) {
+function responseConnectionScopedHeaders(rawHeaders) {
+  const connectionValues = [];
+  for (let index = 0; index < rawHeaders.length; index += 2) {
+    if (rawHeaders[index].toLowerCase() === "connection") connectionValues.push(rawHeaders[index + 1]);
+  }
+  const result = new Set(HOP_BY_HOP_HEADERS);
+  for (const token of connectionTokens(connectionValues)) result.add(token);
+  return result;
+}
+
+function transparentResponseHeaders(incoming) {
+  const blocked = responseConnectionScopedHeaders(incoming.rawHeaders || []);
   const result = {};
-  for (const [rawName, value] of Object.entries(headers)) {
-    const name = rawName.toLowerCase();
-    if (
-      (RESPONSE_HEADER_ALLOWLIST.has(name) || RESPONSE_RATE_LIMIT_HEADER.test(name))
-      && value != null
-    ) {
-      result[name] = value;
-    }
+  const raw = incoming.rawHeaders || [];
+  for (let index = 0; index < raw.length; index += 2) {
+    const name = raw[index].toLowerCase();
+    if (blocked.has(name)) continue;
+    appendHeader(result, name, raw[index + 1]);
   }
   return result;
 }
@@ -495,7 +431,7 @@ function sendJsonError(response, status, message) {
   const body = `${JSON.stringify({ error: { message } })}\n`;
   response.writeHead(status, {
     "cache-control": "no-store",
-    "connection": "close",
+    connection: "close",
     "content-length": Buffer.byteLength(body),
     "content-type": "application/json",
   });
@@ -510,6 +446,9 @@ function socketError(socket, status, reason) {
     [401, "Unauthorized"],
     [403, "Forbidden"],
     [404, "Not Found"],
+    [413, "Payload Too Large"],
+    [414, "URI Too Long"],
+    [431, "Request Header Fields Too Large"],
     [502, "Bad Gateway"],
     [503, "Service Unavailable"],
   ]).get(status) || "Bad Gateway";
@@ -524,10 +463,6 @@ function socketError(socket, status, reason) {
   ].join("\r\n"));
 }
 
-function connectionTokens(value) {
-  return String(value || "").split(",").map((entry) => entry.trim().toLowerCase()).filter(Boolean);
-}
-
 function parseHandshake(buffer) {
   const marker = buffer.indexOf("\r\n\r\n");
   if (marker < 0) return null;
@@ -535,19 +470,22 @@ function parseHandshake(buffer) {
   const lines = headerBlock.split("\r\n");
   const statusMatch = /^HTTP\/1\.[01] ([0-9]{3})(?: |$)/u.exec(lines.shift() || "");
   if (!statusMatch) fail("invalid_websocket_status");
-  const headers = new Map();
+  const headers = [];
   for (const line of lines) {
     if (/^[ \t]/u.test(line)) fail("folded_websocket_header");
     const separator = line.indexOf(":");
     if (separator <= 0) fail("invalid_websocket_header");
     const name = line.slice(0, separator).trim().toLowerCase();
     const value = line.slice(separator + 1).trim();
-    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u.test(name)) fail("invalid_websocket_header_name");
+    if (!SAFE_HEADER_NAME.test(name)) fail("invalid_websocket_header_name");
     if (!SAFE_HEADER_VALUE.test(value)) fail("invalid_websocket_header_value");
-    if (headers.has(name)) fail("duplicate_websocket_header");
-    headers.set(name, value);
+    headers.push([name, value]);
   }
   return { status: Number(statusMatch[1]), headers, rest: buffer.subarray(marker + 4) };
+}
+
+function handshakeValues(handshake, wantedName) {
+  return handshake.headers.filter(([name]) => name === wantedName).map(([, value]) => value);
 }
 
 function websocketAccept(key) {
@@ -560,6 +498,10 @@ function safeLog(logger, event, fields = {}) {
   } catch {
     // Diagnostics must never alter proxy behavior.
   }
+}
+
+function routeLabel(method, suffix) {
+  return `${method || "UNKNOWN"} ${suffix || "/"}`;
 }
 
 export function createBridge(rawConfig, options = {}) {
@@ -584,7 +526,7 @@ export function createBridge(rawConfig, options = {}) {
   };
 
   const server = http.createServer({ maxHeaderSize: 16 * 1024 }, async (request, response) => {
-    let routeName = "unknown";
+    let route = "unknown";
     let release = () => {};
     const controller = new AbortController();
     const onRequestGone = () => controller.abort();
@@ -599,13 +541,11 @@ export function createBridge(rawConfig, options = {}) {
       request.removeListener("aborted", onRequestGone);
       response.removeListener("close", onResponseGone);
     };
+
     try {
-      if (hasBrowserHeaders(request)) fail("browser_request_rejected", 403);
       const { parsed, suffix } = resolveRoute(config, request.url);
-      routeName = HTTP_ROUTES.get(`${request.method} ${suffix}`);
-      if (!routeName) fail("route_not_found", 404);
-      validateIncomingRequest(config, request, routeName);
-      const headers = collectForwardHeaders(request, REQUEST_HEADER_ALLOWLIST);
+      route = routeLabel(request.method, suffix);
+      validateIncomingRequest(config, request);
       if (!(await authorizeClient(config, request))) fail("client_auth_rejected", 401);
       if (!reserve()) fail("bridge_busy", 503);
       release = releaseOnce();
@@ -613,7 +553,9 @@ export function createBridge(rawConfig, options = {}) {
       if (controller.signal.aborted || request.destroyed || response.destroyed) {
         fail("client_disconnected", 499);
       }
+
       const destination = destinationFor(config, suffix, parsed.search);
+      const headers = collectForwardHeaders(request);
       headers.authorization = `Bearer ${providerToken}`;
       headers["x-openai-actor-authorization"] = config.actorAuthorization;
 
@@ -622,19 +564,19 @@ export function createBridge(rawConfig, options = {}) {
         headers,
         method: request.method,
       });
-      const requestLimiter = byteLimitTransform(
-        config.maxRequestBytes,
-        "request_too_large",
-        413,
-      );
+      const requestLimiter = byteLimitTransform(config.maxRequestBytes, "request_too_large", 413);
       let responseLimiter;
       let upstreamResponse;
       let settled = false;
       let requestFinished = false;
       let responseFinished = false;
       let responseStatus = 502;
-      const connectTimer = setTimeout(() => upstreamRequest.destroy(new Error("connect timeout")), config.connectTimeoutMs);
+      const connectTimer = setTimeout(
+        () => upstreamRequest.destroy(new Error("connect timeout")),
+        config.connectTimeoutMs,
+      );
       connectTimer.unref?.();
+
       const cleanup = () => {
         clearTimeout(connectTimer);
         controller.signal.removeEventListener("abort", onAbort);
@@ -660,11 +602,12 @@ export function createBridge(rawConfig, options = {}) {
       };
       const completeIfFinished = () => {
         if (!requestFinished || !responseFinished || !finish()) return;
-        safeLog(logger, "request_complete", { route: routeName, status: responseStatus });
+        safeLog(logger, "request_complete", { route, status: responseStatus });
       };
       const onAbort = () => failTransaction(502, "model provider request failed", { send: false });
       controller.signal.addEventListener("abort", onAbort, { once: true });
       if (controller.signal.aborted) onAbort();
+
       upstreamRequest.once("socket", (socket) => {
         if (!socket.connecting) clearTimeout(connectTimer);
         else socket.once("connect", () => clearTimeout(connectTimer));
@@ -691,19 +634,18 @@ export function createBridge(rawConfig, options = {}) {
         upstreamResponse = incoming;
         clearTimeout(connectTimer);
         const status = upstreamResponse.statusCode || 502;
-        if ((status >= 300 && status < 400) || status === 401 || status === 403 || status === 101) {
+        // These statuses describe authentication between the bridge and its
+        // configured provider, not the user's local ChatGPT session. Do not
+        // make Codex treat them as a reason to invalidate its own login.
+        if (status === 401 || status === 403 || status === 101) {
           failTransaction(502, "model provider request failed");
-          safeLog(logger, "request_complete", { route: routeName, status: 502 });
+          safeLog(logger, "request_complete", { route, status: 502 });
           return;
         }
         responseStatus = status;
-        response.writeHead(status, filteredResponseHeaders(upstreamResponse.headers));
+        response.writeHead(status, transparentResponseHeaders(upstreamResponse));
         response.flushHeaders?.();
-        responseLimiter = byteLimitTransform(
-          config.maxResponseBytes,
-          "response_too_large",
-          502,
-        );
+        responseLimiter = byteLimitTransform(config.maxResponseBytes, "response_too_large", 502);
         responseLimiter.once("error", () => {
           failTransaction(502, "model provider response is too large");
         });
@@ -723,17 +665,20 @@ export function createBridge(rawConfig, options = {}) {
       removeClientListeners();
       release();
       const status = error instanceof BridgeError ? error.status : 502;
-      const message = status === 401
+      const normalizedStatus = status === 499 ? 502 : status;
+      const message = normalizedStatus === 401
         ? "unauthorized"
-        : status === 403
+        : normalizedStatus === 403
           ? "forbidden"
-          : status === 404
+          : normalizedStatus === 404
             ? "not found"
-            : status === 503
-              ? "model bridge unavailable"
-              : "model provider request failed";
-      sendJsonError(response, status === 499 ? 502 : status, message);
-      safeLog(logger, "request_rejected", { route: routeName, status: status === 499 ? 502 : status });
+            : normalizedStatus === 413
+              ? "request is too large"
+              : normalizedStatus === 503
+                ? "model bridge unavailable"
+                : "model provider request failed";
+      sendJsonError(response, normalizedStatus, message);
+      safeLog(logger, "request_rejected", { route, status: normalizedStatus });
     }
   });
 
@@ -743,23 +688,28 @@ export function createBridge(rawConfig, options = {}) {
   });
 
   server.on("upgrade", async (request, clientSocket, head) => {
+    let route = "unknown";
     let release = () => {};
     const controller = new AbortController();
     const onClientGone = () => controller.abort();
     clientSocket.once("error", onClientGone);
     clientSocket.once("close", onClientGone);
     clientSocket.pause();
+
     try {
-      if (hasBrowserHeaders(request)) fail("browser_request_rejected", 403);
       const { parsed, suffix } = resolveRoute(config, request.url);
-      if (request.method !== "GET" || suffix !== "/responses") fail("route_not_found", 404);
+      route = routeLabel(request.method, suffix);
+      if (request.method !== "GET") fail("invalid_websocket_method", 400);
+      if (request.rawHeaders.length / 2 > 64) fail("too_many_headers", 431);
+      if (Buffer.byteLength(request.url || "") > 4096) fail("request_target_too_large", 414);
+
       const connection = rawHeaderValues(request, "connection");
       const upgrade = rawHeaderValues(request, "upgrade");
       const keyValues = rawHeaderValues(request, "sec-websocket-key");
       const versionValues = rawHeaderValues(request, "sec-websocket-version");
       if (
-        connection.length !== 1
-        || !connectionTokens(connection[0]).includes("upgrade")
+        connection.length < 1
+        || !connectionTokens(connection).includes("upgrade")
         || upgrade.length !== 1
         || upgrade[0].toLowerCase() !== "websocket"
         || keyValues.length !== 1
@@ -767,14 +717,15 @@ export function createBridge(rawConfig, options = {}) {
         || versionValues.length !== 1
         || versionValues[0] !== "13"
       ) fail("invalid_websocket_upgrade", 400);
-      validateRoutingHint(request);
-      const headers = collectForwardHeaders(request, WEBSOCKET_HEADER_ALLOWLIST);
+
       if (!(await authorizeClient(config, request))) fail("client_auth_rejected", 401);
       if (!reserve()) fail("bridge_busy", 503);
       release = releaseOnce();
       const providerToken = await loadProviderToken(config, { signal: controller.signal });
       if (controller.signal.aborted || clientSocket.destroyed) fail("client_disconnected", 499);
+
       const destination = destinationFor(config, suffix, parsed.search);
+      const headers = collectForwardHeaders(request);
       headers.host = destination.host;
       headers.authorization = `Bearer ${providerToken}`;
       headers["x-openai-actor-authorization"] = config.actorAuthorization;
@@ -787,7 +738,10 @@ export function createBridge(rawConfig, options = {}) {
       sockets.add(upstreamSocket);
       let handshaken = false;
       let handshakeBuffer = Buffer.alloc(0);
-      const timeout = setTimeout(() => upstreamSocket.destroy(new Error("connect timeout")), config.connectTimeoutMs);
+      const timeout = setTimeout(
+        () => upstreamSocket.destroy(new Error("connect timeout")),
+        config.connectTimeoutMs,
+      );
       timeout.unref?.();
       const onAbort = () => {
         upstreamSocket.destroy();
@@ -818,7 +772,9 @@ export function createBridge(rawConfig, options = {}) {
       upstreamSocket.once("connect", () => {
         const prelude = [
           `GET ${destination.pathname}${destination.search} HTTP/1.1`,
-          ...Object.entries(headers).map(([name, value]) => `${name}: ${value}`),
+          ...Object.entries(headers).flatMap(([name, value]) => (
+            Array.isArray(value) ? value.map((entry) => `${name}: ${entry}`) : [`${name}: ${value}`]
+          )),
           "",
           "",
         ].join("\r\n");
@@ -840,13 +796,18 @@ export function createBridge(rawConfig, options = {}) {
           return;
         }
         if (!parsedHandshake) return;
+
         const expectedAccept = websocketAccept(keyValues[0]);
-        const receivedAccept = parsedHandshake.headers.get("sec-websocket-accept") || "";
+        const acceptValues = handshakeValues(parsedHandshake, "sec-websocket-accept");
+        const upgradeValues = handshakeValues(parsedHandshake, "upgrade");
+        const connectionValues = handshakeValues(parsedHandshake, "connection");
         if (
           parsedHandshake.status !== 101
-          || parsedHandshake.headers.get("upgrade")?.toLowerCase() !== "websocket"
-          || !connectionTokens(parsedHandshake.headers.get("connection")).includes("upgrade")
-          || !safeEqual(receivedAccept, expectedAccept)
+          || acceptValues.length !== 1
+          || upgradeValues.length !== 1
+          || upgradeValues[0].toLowerCase() !== "websocket"
+          || !connectionTokens(connectionValues).includes("upgrade")
+          || !safeEqual(acceptValues[0], expectedAccept)
         ) {
           upstreamSocket.removeListener("data", onHandshake);
           upstreamSocket.destroy();
@@ -854,33 +815,40 @@ export function createBridge(rawConfig, options = {}) {
           release();
           return;
         }
-        const responseLines = [
-          "HTTP/1.1 101 Switching Protocols",
-          "Upgrade: websocket",
-          "Connection: Upgrade",
-          `Sec-WebSocket-Accept: ${receivedAccept}`,
-        ];
-        const selectedProtocol = parsedHandshake.headers.get("sec-websocket-protocol");
-        const requestedProtocols = (rawHeaderValues(request, "sec-websocket-protocol")[0] || "")
-          .split(",")
+
+        const selectedProtocols = handshakeValues(parsedHandshake, "sec-websocket-protocol");
+        const requestedProtocols = rawHeaderValues(request, "sec-websocket-protocol")
+          .flatMap((value) => value.split(","))
           .map((value) => value.trim())
           .filter(Boolean);
-        if (selectedProtocol != null && !requestedProtocols.includes(selectedProtocol)) {
+        if (
+          selectedProtocols.length > 1
+          || (selectedProtocols.length === 1 && !requestedProtocols.includes(selectedProtocols[0]))
+        ) {
           upstreamSocket.removeListener("data", onHandshake);
           upstreamSocket.destroy();
           socketError(clientSocket, 502, "model provider request failed");
           release();
           return;
         }
-        for (const name of ["sec-websocket-protocol", "sec-websocket-extensions"]) {
-          const value = parsedHandshake.headers.get(name);
-          if (value != null && rawHeaderValues(request, name).length === 1) responseLines.push(`${name}: ${value}`);
-        }
-        for (const name of WEBSOCKET_RESPONSE_HEADER_ALLOWLIST) {
-          const value = parsedHandshake.headers.get(name);
-          if (value != null) responseLines.push(`${name}: ${value}`);
+
+        const blocked = new Set(HOP_BY_HOP_HEADERS);
+        blocked.add("sec-websocket-accept");
+        for (const token of connectionTokens(connectionValues)) blocked.add(token);
+        const responseLines = [
+          "HTTP/1.1 101 Switching Protocols",
+          "Upgrade: websocket",
+          "Connection: Upgrade",
+          `Sec-WebSocket-Accept: ${acceptValues[0]}`,
+        ];
+        for (const [name, value] of parsedHandshake.headers) {
+          if (blocked.has(name)) continue;
+          if (name === "sec-websocket-protocol" && !requestedProtocols.length) continue;
+          if (name === "sec-websocket-extensions" && rawHeaderValues(request, name).length === 0) continue;
+          responseLines.push(`${name}: ${value}`);
         }
         responseLines.push("", "");
+
         upstreamSocket.removeListener("data", onHandshake);
         handshaken = true;
         clearTimeout(timeout);
@@ -889,16 +857,22 @@ export function createBridge(rawConfig, options = {}) {
         upstreamSocket.pipe(clientSocket);
         clientSocket.pipe(upstreamSocket);
         clientSocket.resume();
-        safeLog(logger, "websocket_connected", { route: "responses" });
+        safeLog(logger, "websocket_connected", { route });
       });
     } catch (error) {
       release();
       const status = error instanceof BridgeError ? error.status : 502;
+      const normalizedStatus = status === 499 ? 502 : status;
       socketError(
         clientSocket,
-        status,
-        status === 401 ? "unauthorized" : status === 404 ? "not found" : "model provider request failed",
+        normalizedStatus,
+        normalizedStatus === 401
+          ? "unauthorized"
+          : normalizedStatus === 404
+            ? "not found"
+            : "model provider request failed",
       );
+      safeLog(logger, "websocket_rejected", { route, status: normalizedStatus });
     }
   });
 
