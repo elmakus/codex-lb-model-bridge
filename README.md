@@ -1,48 +1,68 @@
 # Codex-LB model bridge
 
 This repository contains a standalone, user-managed bridge for routing Codex
-model traffic through an authenticated local endpoint and an SSH-forwarded
-upstream. It does not include a provider, credentials, host keys, or a
-machine-specific deployment.
+traffic through an authenticated local endpoint and an SSH-forwarded upstream.
+It does not include a provider, credentials, host keys, or a machine-specific
+deployment.
 
 The desktop client keeps its built-in `openai` provider and ChatGPT OAuth
 session. The bridge accepts only loopback traffic, checks the current OAuth
-token from the local authentication snapshot, replaces it with a provider
-token obtained from the configured helper, and forwards only approved headers.
-The SSH tunnel is host-key pinned and forwards a second loopback port to the
-configured upstream port on the remote host.
+token from the local authentication snapshot, replaces that bearer with a
+provider token obtained from the configured helper, and then proxies the Codex
+backend namespace as transparently as possible. The SSH tunnel is host-key
+pinned and forwards a second loopback port to the configured upstream port on
+the remote host.
 
 ## Request path
 
 ```text
 Codex app-server
-  -> 127.0.0.1:<bridge-port>/<generated-64-hex-path>/backend-api/codex
+  -> 127.0.0.1:<bridge-port>/<generated-64-hex-path>/backend-api/codex[/...]
   -> exact local ChatGPT bearer check
-  -> provider token helper and request-header allowlist
-  -> 127.0.0.1:<tunnel-port>
+  -> provider token helper
+  -> transparent Codex HTTP / WebSocket proxying
+  -> 127.0.0.1:<tunnel-port>/backend-api/codex[/...]
   -> host-key-pinned SSH tunnel
   -> 127.0.0.1:<remote-port> on the configured SSH host
 ```
 
-The bridge supports these explicit routes:
+The bridge deliberately does **not** maintain a feature allowlist such as
+`/models`, `/responses`, `/alpha/search`, image, memory, or realtime routes.
+Any HTTP route and method that remains inside the configured
+`/backend-api/codex` namespace is forwarded. WebSocket upgrades are likewise
+accepted for any path inside that namespace after validating the WebSocket
+transport handshake.
 
-- `GET /models`
-- `GET /responses` as a WebSocket upgrade
-- `POST /responses`, including incremental SSE fallback
-- `POST /responses/compact`
-- `POST /alpha/search`, the JSON web-search RPC used by recent Codex clients
+This is intentional: the bridge is an authentication and transport adapter,
+not an application firewall for individual Codex features. A new Codex route
+or metadata header should not require a bridge release merely to keep the
+desktop client working.
 
-All other routes fail closed. Browser-originated requests are rejected. The
-incoming bearer must match the current token in the owner-only authentication
-snapshot; the provider-token helper is not run before that check. Redirects
-and upstream authentication failures become a generic local `502` response.
-WebSocket frames and SSE payloads remain opaque and are not logged.
+The security boundary remains narrow:
 
-The bridge accepts only an HTTP upstream on IPv4 loopback. Request and response
-headers use explicit allowlists, so account, organization, project, cookie,
-API-key, attestation, and forwarding headers are not relayed. Routing hints
-are validated and bounded before the provider helper can run. Request and
-response sizes, connection counts, and idle time are bounded as well.
+- the listener and upstream must both be IPv4 loopback;
+- the public path contains a generated 64-hex component;
+- the incoming bearer must exactly match the current ChatGPT OAuth snapshot;
+- that ChatGPT bearer is never forwarded upstream;
+- the upstream `Authorization` and `x-openai-actor-authorization` values are
+  always set by the bridge;
+- the destination is pinned to the configured loopback
+  `/backend-api/codex` namespace, so the bridge is not an open proxy;
+- HTTP hop-by-hop headers, plus headers named by `Connection`, are stripped and
+  rebuilt as required by the next hop;
+- request/response sizes, connection counts, helper runtime, connect time and
+  idle time remain bounded;
+- provider-side `401`/`403` responses become a generic local `502`, so a
+  provider credential failure does not invalidate the desktop client's own
+  ChatGPT login;
+- WebSocket frames and streamed response bodies remain opaque and are not
+  logged.
+
+All other end-to-end request and response headers are preserved, including
+future `x-codex-*` / `x-openai-*` metadata, cookies, `Location`, `Set-Cookie`,
+and headers that the current bridge version does not know by name. Request
+bodies are also treated opaquely; the bridge does not require JSON or a fixed
+content encoding.
 
 ## Install
 
@@ -57,7 +77,7 @@ export CODEX_EXECUTABLE=/path/to/codex
 export CODEX_LB_SSH_HOST=YOUR_IPV4_ADDRESS
 export CODEX_LB_SSH_USER=YOUR_SSH_ACCOUNT
 export CODEX_LB_REMOTE_PORT=YOUR_REMOTE_PORT
-# Optional: defaults to codex-lb-ssh-key, CODEX-LB bridge port 12455,
+# Optional: defaults to codex-lb-ssh-key, bridge port 12455,
 # and tunnel port 12456.
 export CODEX_LB_SSH_IDENTITY_NAME=codex-lb-ssh-key
 
@@ -93,10 +113,11 @@ Run the complete local test suite with:
 npm test
 ```
 
-The tests use synthetic credentials, hosts, and upstreams only. They exercise
-route allowlisting, credential replacement, header filtering, WebSocket and
-SSE forwarding, bounded streams, unit rendering, installation, rollback, and
-failure recovery.
+The tests use synthetic credentials, hosts, and upstreams only. Bridge tests
+cover transparent forwarding of unknown/future HTTP routes, methods, body
+types and headers; current Codex routes; credential replacement; namespace
+isolation; stream limits; SSE; redirects; provider-auth failures; and generic
+WebSocket paths. Installer and rollback tests cover deployment and recovery.
 
 ## License
 
