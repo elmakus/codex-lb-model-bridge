@@ -38,13 +38,42 @@ const HOP_BY_HOP_HEADERS = new Set([
   "upgrade",
 ]);
 
-// These are the only application headers owned by the bridge. The incoming
-// ChatGPT bearer authenticates the local client but must never become the
-// upstream bearer. Actor authorization is likewise set from bridge config.
+// These application headers are owned by the bridge. The incoming ChatGPT
+// bearer authenticates the local client but must never become the upstream
+// bearer. Actor authorization is likewise set from bridge config.
 const BRIDGE_REQUEST_HEADERS = new Set([
   "authorization",
   "host",
   "x-openai-actor-authorization",
+]);
+
+// Proxy identity is transport metadata, not Codex application metadata. The
+// Codex-LB hop can legitimately trust loopback proxy headers, so values supplied
+// by the desktop client must not be allowed to impersonate the bridge's network
+// identity. This is intentionally separate from x-codex-* / x-openai-* headers,
+// which remain transparent.
+const PROXY_IDENTITY_HEADERS = new Set([
+  "forwarded",
+  "x-real-ip",
+  "true-client-ip",
+  "cf-connecting-ip",
+]);
+
+// Only used to keep logs useful without recording arbitrary path identifiers.
+// Unknown roots are redacted rather than rejected; this list has no routing or
+// forwarding effect.
+const SAFE_LOG_ROUTE_ROOTS = new Set([
+  "agent-identities",
+  "alpha",
+  "analytics-events",
+  "images",
+  "memories",
+  "models",
+  "opportunistic",
+  "realtime",
+  "responses",
+  "safety",
+  "thread",
 ]);
 
 class BridgeError extends Error {
@@ -270,13 +299,17 @@ function connectionScopedRequestHeaders(request) {
   return result;
 }
 
+function isProxyIdentityHeader(name) {
+  return PROXY_IDENTITY_HEADERS.has(name) || name.startsWith("x-forwarded-");
+}
+
 function collectForwardHeaders(request) {
   const blocked = connectionScopedRequestHeaders(request);
   const collected = {};
   for (let index = 0; index < request.rawHeaders.length; index += 2) {
     const name = request.rawHeaders[index].toLowerCase();
     const value = request.rawHeaders[index + 1];
-    if (blocked.has(name) || BRIDGE_REQUEST_HEADERS.has(name)) continue;
+    if (blocked.has(name) || BRIDGE_REQUEST_HEADERS.has(name) || isProxyIdentityHeader(name)) continue;
     appendHeader(collected, name, value);
   }
   return collected;
@@ -410,14 +443,32 @@ function responseConnectionScopedHeaders(rawHeaders) {
   return result;
 }
 
-function transparentResponseHeaders(incoming) {
+function rewriteRedirectLocation(config, status, value) {
+  if (status < 300 || status >= 400 || typeof value !== "string") return value;
+  let target;
+  try {
+    target = new URL(value, config.upstream);
+  } catch {
+    return value;
+  }
+  if (target.origin !== config.upstream.origin) return value;
+  const upstreamPath = config.upstream.pathname;
+  if (target.pathname !== upstreamPath && !target.pathname.startsWith(`${upstreamPath}/`)) return value;
+  const suffix = target.pathname.slice(upstreamPath.length);
+  return `${config.publicBasePath}${suffix}${target.search}${target.hash}`;
+}
+
+function transparentResponseHeaders(config, incoming, status) {
   const blocked = responseConnectionScopedHeaders(incoming.rawHeaders || []);
   const result = {};
   const raw = incoming.rawHeaders || [];
   for (let index = 0; index < raw.length; index += 2) {
     const name = raw[index].toLowerCase();
     if (blocked.has(name)) continue;
-    appendHeader(result, name, raw[index + 1]);
+    const value = name === "location"
+      ? rewriteRedirectLocation(config, status, raw[index + 1])
+      : raw[index + 1];
+    appendHeader(result, name, value);
   }
   return result;
 }
@@ -501,7 +552,15 @@ function safeLog(logger, event, fields = {}) {
 }
 
 function routeLabel(method, suffix) {
-  return `${method || "UNKNOWN"} ${suffix || "/"}`;
+  const segments = String(suffix || "").split("/").filter(Boolean);
+  let pathLabel = "/";
+  if (segments.length > 0) {
+    const root = segments[0];
+    pathLabel = SAFE_LOG_ROUTE_ROOTS.has(root)
+      ? `/${root}${segments.length > 1 ? "/<redacted>" : ""}`
+      : "/<redacted>";
+  }
+  return `${method || "UNKNOWN"} ${pathLabel}`;
 }
 
 export function createBridge(rawConfig, options = {}) {
@@ -634,16 +693,16 @@ export function createBridge(rawConfig, options = {}) {
         upstreamResponse = incoming;
         clearTimeout(connectTimer);
         const status = upstreamResponse.statusCode || 502;
-        // These statuses describe authentication between the bridge and its
-        // configured provider, not the user's local ChatGPT session. Do not
-        // make Codex treat them as a reason to invalidate its own login.
-        if (status === 401 || status === 403 || status === 101) {
+        // A 401 here authenticates the bridge-to-provider hop, not the user's
+        // local ChatGPT session. Mask it so Codex does not invalidate its own
+        // login. Other application statuses, including 403, remain transparent.
+        if (status === 401 || status === 101) {
           failTransaction(502, "model provider request failed");
           safeLog(logger, "request_complete", { route, status: 502 });
           return;
         }
         responseStatus = status;
-        response.writeHead(status, transparentResponseHeaders(upstreamResponse));
+        response.writeHead(status, transparentResponseHeaders(config, upstreamResponse, status));
         response.flushHeaders?.();
         responseLimiter = byteLimitTransform(config.maxResponseBytes, "response_too_large", 502);
         responseLimiter.once("error", () => {
